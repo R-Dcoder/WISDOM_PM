@@ -1,10 +1,11 @@
 """
-orchestrator.py
 WISDOM-PM Full Pipeline Orchestrator
 Runs the complete 3-step framework:
   Step 1 → Historical Trade Analysis & Investor Profiling
   Step 2 → WISDOM Decision Matrix (4 agents, parallel scoring)
   Step 3 → Architecture checks + Trade Memo generation
+
+Now integrates real trade data from Excel ledger.
 """
 
 from __future__ import annotations
@@ -13,14 +14,14 @@ import json
 from datetime import datetime
 from typing import Dict, Optional
 
-from config import PORTFOLIO_STOCKS
-from agents.quant_analyst   import QuantAnalystAgent, QuantAnalystOutput
+from config import PORTFOLIO_STOCKS, get_trade_ledger
+from agents.quant_analyst import QuantAnalystAgent, QuantAnalystOutput
 from agents.qual_researcher import QualResearcherAgent, QualResearchOutput
-from agents.risk_manager    import RiskManagerAgent, RiskAssessmentOutput
+from agents.risk_manager import RiskManagerAgent, RiskAssessmentOutput
 from agents.portfolio_manager import PortfolioManagerAgent, PMOrchestrationOutput
-from data.market_data       import FundamentalSnapshot
-from rag.vector_store       import WisdomVectorStore
-from scoring.wisdom_scorer  import WisdomScoreResult
+from data.market_data import FundamentalSnapshot
+from rag.vector_store import WisdomVectorStore
+from scoring.wisdom_scorer import WisdomScoreResult
 
 
 class WisdomPMOrchestrator:
@@ -29,21 +30,26 @@ class WisdomPMOrchestrator:
     and runs the 3-step WISDOM-PM framework.
     """
 
-    def __init__(self, macro_shock: bool = False):
+    def __init__(self, macro_shock: bool = False, data_dir: Optional[str] = None):
         self.macro_shock = macro_shock
-        self.vs          = WisdomVectorStore()
+        self.data_dir = data_dir
+        
+        # Load trade ledger
+        self.trade_ledger = get_trade_ledger()
+        
+        self.vs = WisdomVectorStore()
         self.quant_agent = QuantAnalystAgent()
-        self.qual_agent  = QualResearcherAgent(vector_store=self.vs)
-        self.risk_agent  = RiskManagerAgent()
-        self.pm_agent    = PortfolioManagerAgent()
+        self.qual_agent = QualResearcherAgent(vector_store=self.vs)
+        self.risk_agent = RiskManagerAgent()
+        self.pm_agent = PortfolioManagerAgent()
 
         # Shared state filled during run
         self.quant_outputs: Dict[str, QuantAnalystOutput] = {}
-        self.qual_outputs:  Dict[str, QualResearchOutput] = {}
-        self.snapshots:     Dict[str, FundamentalSnapshot] = {}
-        self.scores:        Dict[str, WisdomScoreResult]   = {}
-        self.risk_output:   Optional[RiskAssessmentOutput] = None
-        self.pm_output:     Optional[PMOrchestrationOutput] = None
+        self.qual_outputs: Dict[str, QualResearchOutput] = {}
+        self.snapshots: Dict[str, FundamentalSnapshot] = {}
+        self.scores: Dict[str, WisdomScoreResult] = {}
+        self.risk_output: Optional[RiskAssessmentOutput] = None
+        self.pm_output: Optional[PMOrchestrationOutput] = None
         self.run_timestamp: str = ""
 
     # ── Main entry point ──────────────────────────────────────────────────────
@@ -100,6 +106,10 @@ class WisdomPMOrchestrator:
                     for f in (self.risk_output.flags if self.risk_output else [])
                 ],
             },
+            "trade_ledger": {
+                "total_trades": len(self.trade_ledger.trades) if self.trade_ledger else 0,
+                "open_positions": len([p for p in self.trade_ledger.positions.values() if p.qty > 0]) if self.trade_ledger else 0,
+            } if self.trade_ledger else {},
         }, indent=2)
 
     def approve_memo(self, ticker: str, by: str = "Fund Manager") -> bool:

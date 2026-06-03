@@ -168,7 +168,7 @@ def print_step1(orch: "WisdomPMOrchestrator") -> None:
     biases = get_identified_biases()
     bias_table = Table(title="Identified Investor Biases (Algorithmic Detection)", box=box.ROUNDED, border_style="red")
     bias_table.add_column("Bias", style="bold yellow", width=28)
-    bias_bias.add_column("Stocks", width=14)
+    bias_table.add_column("Stocks", width=14)
     bias_table.add_column("Mitigation", width=52)
 
     for bias_id, b in biases.items():

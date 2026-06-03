@@ -3,12 +3,13 @@
 main.py — WISDOM-PM CLI Entry Point
 =====================================
 Usage:
-  python main.py run            # Full 3-step pipeline
-  python main.py run --macro    # Simulate macro shock (anti-panic test)
-  python main.py score AMBER    # Score a single stock
-  python main.py step1          # Historical trade analysis only
-  python main.py arch           # Print architecture diagram
-  python main.py export         # Run pipeline and export JSON report
+  python main.py run                          # Full 3-step pipeline
+  python main.py run --macro                  # Simulate macro shock (anti-panic test)
+  python main.py run --data-dir ./trade_data  # Use custom Excel files location
+  python main.py score AMBER                  # Score a single stock
+  python main.py step1                        # Historical trade analysis only
+  python main.py arch                         # Print architecture diagram
+  python main.py export                       # Run pipeline and export JSON report
 """
 
 from __future__ import annotations
@@ -41,12 +42,15 @@ app = typer.Typer(
     add_completion=False,
 )
 
-
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
-def _run_pipeline(macro_shock: bool = False, skip_hitl: bool = False) -> WisdomPMOrchestrator:
+def _run_pipeline(
+    macro_shock: bool = False, 
+    skip_hitl: bool = False,
+    data_dir: Optional[str] = None,
+) -> WisdomPMOrchestrator:
     """Core pipeline runner with Rich progress bar."""
-    orch = WisdomPMOrchestrator(macro_shock=macro_shock)
+    orch = WisdomPMOrchestrator(macro_shock=macro_shock, data_dir=data_dir)
 
     with make_progress() as progress:
         from config import PORTFOLIO_STOCKS
@@ -101,8 +105,8 @@ def _run_pipeline(macro_shock: bool = False, skip_hitl: bool = False) -> WisdomP
         )
         progress.advance(task)
 
-    orch.run_timestamp = __import__("datetime").datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    return orch
+        orch.run_timestamp = __import__("datetime").datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        return orch
 
 
 # ── CLI Commands ──────────────────────────────────────────────────────────────
@@ -112,6 +116,12 @@ def run(
     macro: bool = typer.Option(False, "--macro", "-m", help="Simulate a macro shock (anti-panic test)"),
     no_hitl: bool = typer.Option(False, "--no-hitl", help="Skip interactive approval prompts"),
     export: bool = typer.Option(False, "--export", "-e", help="Export JSON report after run"),
+    data_dir: Optional[Path] = typer.Option(
+        None, 
+        "--data-dir", 
+        "-d",
+        help="Directory containing Excel trade files (default: ./trade_data)",
+    ),
 ):
     """
     Run the full 3-step WISDOM-PM pipeline and display results.
@@ -121,9 +131,14 @@ def run(
     if macro:
         console.print("[bold yellow]⚡ MACRO SHOCK MODE — anti-panic locks will engage for eligible stocks.[/]\n")
 
-    console.print(f"[dim]Starting WISDOM-PM pipeline… {'(macro shock)' if macro else ''}[/]\n")
+    data_dir_str = str(data_dir) if data_dir else None
+    console.print(f"[dim]Starting WISDOM-PM pipeline… {'(macro shock)' if macro else ''}[/]")
+    if data_dir_str:
+        console.print(f"[dim]Using trade data from: {data_dir_str}[/]")
+    console.print()
+    
     t0 = time.time()
-    orch = _run_pipeline(macro_shock=macro)
+    orch = _run_pipeline(macro_shock=macro, data_dir=data_dir_str)
     elapsed = time.time() - t0
     console.print(f"[dim]Pipeline completed in {elapsed:.1f}s[/]\n")
 
@@ -145,7 +160,7 @@ def run(
     for memo in orch.pm_output.memos:
         status_str = "PENDING" if memo.approved is None else ("✓ APPROVED" if memo.approved else "✗ REJECTED")
         style = "yellow" if memo.approved is None else ("green" if memo.approved else "red")
-        console.print(f"  [{style}]{status_str}[/]  {memo.ticker:<10} {memo.recommendation}")
+        console.print(f"  [{style}]{status_str}[/] {memo.ticker:<10} {memo.recommendation}")
 
     if export:
         _export_json(orch)
@@ -154,7 +169,7 @@ def run(
 @app.command()
 def score(
     ticker: str = typer.Argument(..., help="Stock ticker (AMBER / WELSPUN / ZEEL / DBL)"),
-    macro:  bool = typer.Option(False, "--macro", "-m"),
+    macro: bool = typer.Option(False, "--macro", "-m"),
 ):
     """Score a single stock on the WISDOM 5-principle matrix."""
     from config import PORTFOLIO_STOCKS
@@ -181,28 +196,36 @@ def score(
 
     table = Table(title=f"WISDOM Score — {ticker}", box=box.ROUNDED)
     table.add_column("Principle", width=28)
-    table.add_column("Score",     justify="center", width=10)
-    table.add_column("Checks",                      width=55)
+    table.add_column("Score", justify="center", width=10)
+    table.add_column("Checks", width=55)
 
     for p in result.principles:
         color = "green" if p.score >= 7 else ("yellow" if p.score >= 5 else "red")
-        checks_str = "  |  ".join(f"{c[0][:28]} {'✓' if c[1] else '✗'}" for c in p.checks[:2])
+        checks_str = " | ".join(f"{c[0][:28]} {'✓' if c[1] else '✗'}" for c in p.checks[:2])
         table.add_row(p.name, f"[{color}]{p.score:.1f}[/]", checks_str)
 
     console.print(table)
     from dashboard.terminal_ui import SIGNAL_STYLE
     sig_style = SIGNAL_STYLE.get(result.signal, "white")
     console.print(f"\n  Total WISDOM Score: [bold gold1]{result.total_score:.2f} / 10[/]")
-    console.print(f"  Signal: [{sig_style}]{result.signal}[/]  —  {result.trigger_reason}")
+    console.print(f"  Signal: [{sig_style}]{result.signal}[/] — {result.trigger_reason}")
     if result.anti_panic_active:
         console.print("  [yellow]🔒 Anti-panic lock ACTIVE[/]")
 
 
 @app.command()
-def step1():
+def step1(
+    data_dir: Optional[Path] = typer.Option(
+        None, 
+        "--data-dir", 
+        "-d",
+        help="Directory containing Excel trade files (default: ./trade_data)",
+    ),
+):
     """Display Step 1: Historical trade analysis and investor bias profile."""
     print_header()
-    orch = WisdomPMOrchestrator()
+    data_dir_str = str(data_dir) if data_dir else None
+    orch = WisdomPMOrchestrator(data_dir=data_dir_str)
     print_step1(orch)
 
 
@@ -217,11 +240,18 @@ def arch():
 def export_report(
     output: Path = typer.Option(Path("wisdom_pm_report.json"), "--output", "-o"),
     macro: bool = typer.Option(False, "--macro", "-m"),
+    data_dir: Optional[Path] = typer.Option(
+        None, 
+        "--data-dir", 
+        "-d",
+        help="Directory containing Excel trade files (default: ./trade_data)",
+    ),
 ):
     """Run the pipeline and export a full JSON report."""
     print_header()
     console.print("[cyan]Running pipeline for JSON export…[/]")
-    orch = _run_pipeline(macro_shock=macro)
+    data_dir_str = str(data_dir) if data_dir else None
+    orch = _run_pipeline(macro_shock=macro, data_dir=data_dir_str)
     _export_json(orch, output)
 
 

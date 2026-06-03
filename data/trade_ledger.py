@@ -98,6 +98,69 @@ class TradeLedger:
         # Load Excel files if available
         self._load_all_files()
     
+    def _parse_date_value(self, date_val) -> Optional[datetime]:
+        """
+        Safely parse date value that could be:
+        - Excel serial number (float/int)
+        - datetime object (already parsed by pandas)
+        - string date in DD-MM-YY format
+        - None/NaN
+        """
+        if pd.isna(date_val):
+            return None
+        
+        # If already a datetime object, return as-is
+        if isinstance(date_val, datetime):
+            return date_val
+        
+        # If it's a pandas Timestamp, convert to datetime
+        if hasattr(date_val, 'to_pydatetime'):
+            return date_val.to_pydatetime()
+        
+        # If it's a string, try to parse it
+        if isinstance(date_val, str):
+            # Remove any whitespace
+            date_val = date_val.strip()
+            try:
+                # Try DD-MM-YY format first (most common in Indian Excel sheets)
+                if len(date_val) == 8 and '-' in date_val:
+                    # DD-MM-YY format
+                    return datetime.strptime(date_val, '%d-%m-%y')
+                elif len(date_val) == 10 and '-' in date_val:
+                    # DD-MM-YYYY format
+                    return datetime.strptime(date_val, '%d-%m-%Y')
+                
+                # Try other common formats
+                for fmt in ['%Y-%m-%d', '%m/%d/%Y', '%d/%m/%Y', '%Y/%m/%d']:
+                    try:
+                        return datetime.strptime(date_val, fmt)
+                    except ValueError:
+                        continue
+                
+                # If all formats fail, let pandas try
+                return pd.to_datetime(date_val, dayfirst=True).to_pydatetime()
+            except Exception:
+                return None
+        
+        # If it's a number, assume it's an Excel serial date
+        if isinstance(date_val, (int, float)):
+            return self._excel_date_to_datetime(date_val)
+        
+        # Fallback: try to convert to datetime
+        try:
+            return pd.to_datetime(date_val, dayfirst=True).to_pydatetime()
+        except Exception:
+            return None
+    
+    def _safe_float(self, val) -> float:
+        """Safely convert value to float, returning 0 if conversion fails."""
+        if pd.isna(val):
+            return 0.0
+        try:
+            return float(val)
+        except (ValueError, TypeError):
+            return 0.0
+    
     def _excel_date_to_datetime(self, excel_date: float) -> datetime:
         """Convert Excel serial date to Python datetime."""
         # Excel date system starts from 1899-12-30 (or 1904 for Mac)
@@ -108,73 +171,108 @@ class TradeLedger:
         """
         Parse a single Excel file.
         Returns (ticker, list of trades).
+        
+        Expected Excel structure:
+        Purchase                | Sale
+        Date | Qty | Rate | Amount | Date | Qty | Rate | Amount
         """
-        ticker = filepath.stem.upper()  # e.g., "Amber.xlsx" → "AMBER"
+        ticker = filepath.stem.upper()  # e.g., "Welspun.xlsx" → "WELSPUN"
         trades = []
         
         try:
-            df = pd.read_excel(filepath, engine='openpyxl')
+            # Read Excel file without parsing dates automatically
+            df = pd.read_excel(filepath, engine='openpyxl', header=None)
             
-            # Expected columns: Date (buy), Qty (buy), Rate (buy), Amount (buy), 
-            #                   Date (sell), Qty (sell), Rate (sell), Amount (sell)
-            # Normalize column names
-            df.columns = [col.strip().lower() for col in df.columns]
+            # Find the header row (usually contains "Purchase" and "Sale")
+            header_row_idx = None
+            for idx in range(min(5, len(df))):  # Check first 5 rows
+                row_str = ' '.join(str(val).lower() for val in df.iloc[idx].values if pd.notna(val))
+                if 'purchase' in row_str or 'sale' in row_str or 'date' in row_str:
+                    header_row_idx = idx + 1  # Data starts after header
+                    break
             
-            for _, row in df.iterrows():
-                # Skip total/summary rows
-                if pd.isna(row.get('date (buy)', row.get('date', None))):
+            if header_row_idx is None:
+                header_row_idx = 2  # Default: assume headers are in row 2-3
+            
+            # Read again with proper headers
+            df = pd.read_excel(
+                filepath, 
+                engine='openpyxl',
+                header=None,
+                skiprows=header_row_idx,
+                na_values=['######', '']
+            )
+            
+            # Assign column names based on structure
+            # Expected: Date, Qty, Rate, Amount, Date, Qty, Rate, Amount
+            if len(df.columns) >= 8:
+                df.columns = ['buy_date', 'buy_qty', 'buy_rate', 'buy_amount', 
+                              'sell_date', 'sell_qty', 'sell_rate', 'sell_amount']
+            elif len(df.columns) == 4:
+                # Only purchase side columns
+                df.columns = ['buy_date', 'buy_qty', 'buy_rate', 'buy_amount']
+                df['sell_date'] = None
+                df['sell_qty'] = None
+                df['sell_rate'] = None
+                df['sell_amount'] = None
+            else:
+                print(f"⚠️  Warning: {filepath.name} has unexpected column structure: {len(df.columns)} columns")
+                return ticker, []
+            
+            # Process each row
+            for idx, row in df.iterrows():
+                # Skip empty rows
+                if pd.isna(row.get('buy_date')) and pd.isna(row.get('sell_date')):
+                    continue
+                
+                # Parse and convert values to float safely
+                buy_qty_val = self._safe_float(row.get('buy_qty'))
+                buy_rate_val = self._safe_float(row.get('buy_rate'))
+                sell_qty_val = self._safe_float(row.get('sell_qty'))
+                sell_rate_val = self._safe_float(row.get('sell_rate'))
+                
+                # Skip total/summary rows (heuristic: very large quantities)
+                if buy_qty_val > 100000:  # Likely a total row
                     continue
                 
                 # Parse buy side
-                buy_date_val = row.get('date (buy)', row.get('date', None))
-                if pd.notna(buy_date_val):
-                    buy_date = (self._excel_date_to_datetime(buy_date_val) 
-                               if isinstance(buy_date_val, (int, float)) 
-                               else pd.to_datetime(buy_date_val).to_pydatetime())
-                    
-                    buy_qty = float(row.get('qty (buy)', row.get('qty', 0)) or 0)
-                    buy_rate = float(row.get('rate (buy)', row.get('rate', 0)) or 0)
-                    buy_amount = float(row.get('amount (buy)', row.get('amount', 0)) or 0)
-                    
-                    if buy_qty > 0 and buy_rate > 0:
-                        trades.append(TradeRecord(
-                            ticker=ticker,
-                            date=buy_date,
-                            qty=buy_qty,
-                            rate=buy_rate,
-                            amount=buy_amount if buy_amount > 0 else buy_qty * buy_rate,
-                            side='BUY'
-                        ))
+                buy_date = self._parse_date_value(row.get('buy_date'))
+                buy_amount = self._safe_float(row.get('buy_amount'))
                 
-                # Parse sell side (if exists on same row)
-                sell_date_val = row.get('date (sell)', None)
-                if pd.notna(sell_date_val):
-                    sell_date = (self._excel_date_to_datetime(sell_date_val)
-                                if isinstance(sell_date_val, (int, float))
-                                else pd.to_datetime(sell_date_val).to_pydatetime())
-                    
-                    sell_qty = float(row.get('qty (sell)', 0) or 0)
-                    sell_rate = float(row.get('rate (sell)', 0) or 0)
-                    sell_amount = float(row.get('amount (sell)', 0) or 0)
-                    
-                    if sell_qty > 0 and sell_rate > 0:
-                        trades.append(TradeRecord(
-                            ticker=ticker,
-                            date=sell_date,
-                            qty=sell_qty,
-                            rate=sell_rate,
-                            amount=sell_amount if sell_amount > 0 else sell_qty * sell_rate,
-                            side='SELL'
-                        ))
+                if pd.notna(buy_date) and buy_qty_val > 0 and buy_rate_val > 0:
+                    trades.append(TradeRecord(
+                        ticker=ticker,
+                        date=buy_date,
+                        qty=buy_qty_val,
+                        rate=buy_rate_val,
+                        amount=buy_amount if buy_amount > 0 else buy_qty_val * buy_rate_val,
+                        side='BUY'
+                    ))
+                
+                # Parse sell side (if exists)
+                sell_date = self._parse_date_value(row.get('sell_date'))
+                sell_amount = self._safe_float(row.get('sell_amount'))
+                
+                if pd.notna(sell_date) and sell_qty_val > 0 and sell_rate_val > 0:
+                    trades.append(TradeRecord(
+                        ticker=ticker,
+                        date=sell_date,
+                        qty=sell_qty_val,
+                        rate=sell_rate_val,
+                        amount=sell_amount if sell_amount > 0 else sell_qty_val * sell_rate_val,
+                        side='SELL'
+                    ))
             
             # Store ticker name from first trade if not already set
             if ticker not in self.ticker_names and trades:
-                self.ticker_names[ticker] = ticker  # Can be enhanced to read from file metadata
+                self.ticker_names[ticker] = ticker
             
             return ticker, trades
             
         except Exception as e:
             print(f"⚠️  Warning: Failed to parse {filepath.name}: {e}")
+            import traceback
+            traceback.print_exc()
             return ticker, []
     
     def _load_all_files(self) -> None:

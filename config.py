@@ -1,31 +1,57 @@
 """
 WISDOM-PM Configuration
 Central config for thresholds, tickers, and system parameters.
+Now integrates real trade data from Excel files.
 """
 
 import os
 from dataclasses import dataclass, field
-from typing import Dict, List
+from typing import Dict, List, Optional
 from dotenv import load_dotenv
+from pathlib import Path
 
 load_dotenv()
-
 
 # ─── API Keys ────────────────────────────────────────────────────────────────
 ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY", "")
 LLM_MODEL = "claude-sonnet-4-20250514"
 
-
 # ─── Portfolio ────────────────────────────────────────────────────────────────
 AUM_INR_CRORES = 10.0
 
 PORTFOLIO_STOCKS = {
-    "AMBER":   {"name": "Amber Enterprises India Ltd",  "yf_ticker": "AMBER.NS",   "sector": "EMS / AC Manufacturing",    "allocation_pct": 35},
-    "WELSPUN": {"name": "Welspun Living Ltd",           "yf_ticker": "WELSPUNLIV.NS","sector": "Textiles / FTA Beneficiary","allocation_pct": 25},
-    "ZEEL":    {"name": "Zee Entertainment Enterprises","yf_ticker": "ZEEL.NS",    "sector": "Media / Linear TV",          "allocation_pct": 20},
-    "DBL":     {"name": "Dilip Buildcon Ltd",           "yf_ticker": "DBL.NS",     "sector": "EPC / Infrastructure",       "allocation_pct": 20},
+    "AMBER": {"name": "Amber Enterprises India Ltd", "yf_ticker": "AMBER.NS", "sector": "EMS / AC Manufacturing", "allocation_pct": 35},
+    "WELSPUN": {"name": "Welspun Living Ltd", "yf_ticker": "WELSPUNLIV.NS","sector": "Textiles / FTA Beneficiary","allocation_pct": 25},
+    "ZEEL": {"name": "Zee Entertainment Enterprises","yf_ticker": "ZEEL.NS", "sector": "Media / Linear TV", "allocation_pct": 20},
+    "DBL": {"name": "Dilip Buildcon Ltd", "yf_ticker": "DBL.NS", "sector": "EPC / Infrastructure", "allocation_pct": 20},
 }
 
+# ─── Trade Data Directory ────────────────────────────────────────────────────
+TRADE_DATA_DIR = os.getenv(
+    "TRADE_DATA_DIR", 
+    str(Path(__file__).parent / "trade_data")
+)
+
+# ─── Lazy-loaded trade ledger ────────────────────────────────────────────────
+_trade_ledger_cache: Optional["TradeLedger"] = None
+
+def get_trade_ledger() -> "TradeLedger":
+    """
+    Get or create TradeLedger instance.
+    Lazy-loads to avoid circular imports.
+    """
+    global _trade_ledger_cache
+    if _trade_ledger_cache is None:
+        from data.trade_ledger import TradeLedger
+        _trade_ledger_cache = TradeLedger(data_dir=TRADE_DATA_DIR)
+    return _trade_ledger_cache
+
+def refresh_trade_ledger() -> "TradeLedger":
+    """Force reload of trade ledger (useful for testing)."""
+    global _trade_ledger_cache
+    from data.trade_ledger import TradeLedger
+    _trade_ledger_cache = TradeLedger(data_dir=TRADE_DATA_DIR)
+    return _trade_ledger_cache
 
 # ─── WISDOM Score Thresholds ───────────────────────────────────────────────────
 @dataclass
@@ -33,26 +59,25 @@ class WisdomThresholds:
     """Quantitative thresholds for all 5 WISDOM principles."""
 
     # Principle 1 — Business Quality
-    roce_min_pct: float = 15.0          # ROCE must exceed this
-    roce_years_min: int = 5             # In at least N of last 10 years
-    fcf_yield_min_pct: float = 5.0      # Free Cash Flow yield minimum
+    roce_min_pct: float = 15.0  # ROCE must exceed this
+    roce_years_min: int = 5     # In at least N of last 10 years
+    fcf_yield_min_pct: float = 5.0  # Free Cash Flow yield minimum
 
     # Principle 2 — Skin in the Game
     promoter_holding_min_pct: float = 40.0
     pledged_shares_max_pct: float = 5.0
 
     # Principle 3 — Reinvestment Runway
-    retention_ratio_min_pct: float = 60.0   # Earnings retained (1 – payout ratio)
-    capex_revenue_trending: bool = True      # Capex/Revenue should be rising
+    retention_ratio_min_pct: float = 60.0  # Earnings retained (1 – payout ratio)
+    capex_revenue_trending: bool = True    # Capex/Revenue should be rising
 
     # Principle 4 — Structural vs Cyclical
-    revenue_beta_max: float = 1.2           # Revenue volatility beta
-    cyclical_flag: bool = False             # True if earnings are cyclical
+    revenue_beta_max: float = 1.2  # Revenue volatility beta
+    cyclical_flag: bool = False    # True if earnings are cyclical
 
     # Principle 5 — Balance Sheet
     debt_equity_max: float = 0.5
     interest_coverage_min: float = 4.0
-
 
 # ─── Signal Triggers ──────────────────────────────────────────────────────────
 @dataclass
@@ -66,19 +91,75 @@ class SignalTriggers:
 
     # HOLD (Anti-panic mechanism)
     hold_wisdom_score_min: float = 7.0
-    hold_price_drop_macro_pct: float = 20.0   # If drop > 20% due to macro → freeze
+    hold_price_drop_macro_pct: float = 20.0  # If drop > 20% due to macro → freeze
 
     # SELL
     sell_roce_below_pct: float = 12.0
-    sell_roce_consecutive_quarters: int = 2    # Consecutive quarters below threshold
-    sell_governance_flag: bool = True          # Promoter pledge spike or RPT
-
+    sell_roce_consecutive_quarters: int = 2  # Consecutive quarters below threshold
+    sell_governance_flag: bool = True        # Promoter pledge spike or RPT
 
 THRESHOLDS = WisdomThresholds()
 TRIGGERS = SignalTriggers()
 
+# ─── Investor Bias Profiles (dynamic, populated from trade data) ─────────────
+def get_identified_biases() -> Dict:
+    """
+    Get bias profiles, dynamically updated from actual trade history.
+    Falls back to static definitions if ledger unavailable.
+    """
+    try:
+        ledger = get_trade_ledger()
+        detected = ledger.detect_biases()
+    except Exception:
+        detected = {}
+    
+    # Base definitions
+    base_biases = {
+        "macro_panic": {
+            "name": "Recency / Macro Panic Bias",
+            "description": (
+                "Prone to panic-selling high-quality assets during systemic shocks "
+                "(e.g., Welspun Mar 2020 at ₹21, a -70% loss). Business durability "
+                "ignored during liquidity crises."
+            ),
+            "affected_stocks": ["WELSPUN"],
+            "mitigation": "Anti-panic HOLD lock: WISDOM Score > 7 + macro-only drop → portfolio freeze",
+        },
+        "sunk_cost": {
+            "name": "Sunk Cost Fallacy",
+            "description": (
+                "Reluctance to exit structurally impaired businesses. Repeated averaging "
+                "down in Zee Entertainment despite structural linear TV disruption."
+            ),
+            "affected_stocks": ["ZEEL"],
+            "mitigation": "Thesis-break SELL trigger: ROCE < 12% for 2 consecutive quarters auto-generates SELL memo",
+        },
+        "cyclical_trap": {
+            "name": "Cyclical Trap",
+            "description": (
+                "Misinterpreting cyclical order-book peaks as structural durability. "
+                "DBL's EPC peaks treated as compounding signal."
+            ),
+            "affected_stocks": ["DBL"],
+            "mitigation": "Revenue Beta check > 1.2 flags cyclical pattern and downgrades Principle 4 score",
+        },
+    }
+    
+    # Enhance with detected evidence
+    for ticker, ticker_biases in detected.items():
+        for bias in ticker_biases:
+            bias_type = bias["type"].lower()
+            if bias_type in base_biases:
+                # Add specific evidence
+                base_biases[bias_type]["detected_evidence"] = base_biases[bias_type].get("detected_evidence", [])
+                base_biases[bias_type]["detected_evidence"].append({
+                    "ticker": ticker,
+                    **bias
+                })
+    
+    return base_biases
 
-# ─── Investor Bias Profiles ───────────────────────────────────────────────────
+# Backward compatibility - static version
 IDENTIFIED_BIASES = {
     "macro_panic": {
         "name": "Recency / Macro Panic Bias",
@@ -110,55 +191,116 @@ IDENTIFIED_BIASES = {
     },
 }
 
-
 # ─── Historical Trade Snapshots (Step 1 data) ─────────────────────────────────
-HISTORICAL_TRADES = [
-    {
-        "ticker": "AMBER", "action": "BUY",  "year": 2017, "price": 835,
-        "qty": 400, "thesis": "India EMS/AC manufacturing structural megatrend, PLI beneficiary",
-    },
-    {
-        "ticker": "AMBER", "action": "HOLD", "year": 2021, "price": 3200,
-        "qty": 400, "thesis": "Structural theme intact, PCBA margins expanding",
-    },
-    {
-        "ticker": "WELSPUN", "action": "BUY",  "year": 2018, "price": 72,
-        "qty": 1500, "thesis": "Home textile export leader, balance sheet improving",
-    },
-    {
-        "ticker": "WELSPUN", "action": "SELL", "year": 2020, "price": 21,
-        "qty": 1500, "thesis": "PANIC SELL — Covid liquidity crisis (bias: macro panic)",
-        "bias": "macro_panic",
-    },
-    {
-        "ticker": "WELSPUN", "action": "BUY",  "year": 2020, "price": 38,
-        "qty": 1500, "thesis": "Re-entry — India-UK FTA tailwind, balance sheet recovery",
-    },
-    {
-        "ticker": "ZEEL", "action": "BUY",  "year": 2019, "price": 340,
-        "qty": 800, "thesis": "Large-cap media, dividend yield play",
-    },
-    {
-        "ticker": "ZEEL", "action": "BUY",  "year": 2020, "price": 175,
-        "qty": 500, "thesis": "Averaging down (bias: sunk cost fallacy)",
-        "bias": "sunk_cost",
-    },
-    {
-        "ticker": "ZEEL", "action": "BUY",  "year": 2022, "price": 220,
-        "qty": 300, "thesis": "Sony merger optimism (bias: sunk cost fallacy)",
-        "bias": "sunk_cost",
-    },
-    {
-        "ticker": "DBL",  "action": "BUY",  "year": 2021, "price": 580,
-        "qty": 600, "thesis": "Infrastructure capex supercycle, record order book",
-    },
-    {
-        "ticker": "DBL",  "action": "HOLD", "year": 2022, "price": 370,
-        "qty": 600, "thesis": "Holding through cycle turn (bias: cyclical trap)",
-        "bias": "cyclical_trap",
-    },
-]
+def get_historical_trades() -> List[Dict]:
+    """
+    Get historical trades from real Excel data.
+    Falls back to demo data if files unavailable.
+    """
+    try:
+        ledger = get_trade_ledger()
+        trades = ledger.get_trade_history()
+        
+        # Convert to legacy format for backward compatibility
+        result = []
+        biases = ledger.detect_biases()
+        
+        for trade in trades:
+            # Detect if this trade is part of a bias pattern
+            bias_tag = None
+            ticker_biases = biases.get(trade.ticker, [])
+            for b in ticker_biases:
+                if b["type"] == "MACRO_PANIC" and trade.side == "SELL":
+                    if abs(trade.date - b["date"]).days <= 1:
+                        bias_tag = "macro_panic"
+                elif b["type"] == "SUNK_COST" and trade.side == "BUY":
+                    bias_tag = "sunk_cost"
+                elif b["type"] == "CYCLICAL_TRAP" and trade.side == "SELL":
+                    bias_tag = "cyclical_trap"
+            
+            entry = {
+                "ticker": trade.ticker,
+                "action": trade.side,
+                "year": trade.date.year,
+                "price": trade.rate,
+                "qty": trade.qty,
+                "thesis": _generate_thesis(trade, ticker_biases),
+            }
+            
+            if bias_tag:
+                entry["bias"] = bias_tag
+            
+            result.append(entry)
+        
+        return result
+        
+    except Exception as e:
+        print(f"⚠️  Using fallback trade data: {e}")
+        return _get_fallback_trades()
 
+def _generate_thesis(trade, biases: List[dict]) -> str:
+    """Generate thesis/note for a trade based on context."""
+    # Simple thesis generation - can be enhanced
+    if trade.side == "BUY":
+        return f"Position entry at ₹{trade.rate:.1f}"
+    else:
+        # Check if panic sell
+        for b in biases:
+            if b["type"] == "MACRO_PANIC":
+                return f"PANIC SELL — macro liquidity crisis [BIAS: MACRO_PANIC]"
+        return f"Position exit at ₹{trade.rate:.1f}"
+
+def _get_fallback_trades() -> List[Dict]:
+    """Fallback demo trades when Excel files unavailable."""
+    return [
+        {
+            "ticker": "AMBER", "action": "BUY", "year": 2017, "price": 835,
+            "qty": 400, "thesis": "India EMS/AC manufacturing structural megatrend, PLI beneficiary",
+        },
+        {
+            "ticker": "AMBER", "action": "HOLD", "year": 2021, "price": 3200,
+            "qty": 400, "thesis": "Structural theme intact, PCBA margins expanding",
+        },
+        {
+            "ticker": "WELSPUN", "action": "BUY", "year": 2018, "price": 72,
+            "qty": 1500, "thesis": "Home textile export leader, balance sheet improving",
+        },
+        {
+            "ticker": "WELSPUN", "action": "SELL", "year": 2020, "price": 21,
+            "qty": 1500, "thesis": "PANIC SELL — Covid liquidity crisis (bias: macro panic)",
+            "bias": "macro_panic",
+        },
+        {
+            "ticker": "WELSPUN", "action": "BUY", "year": 2020, "price": 38,
+            "qty": 1500, "thesis": "Re-entry — India-UK FTA tailwind, balance sheet recovery",
+        },
+        {
+            "ticker": "ZEEL", "action": "BUY", "year": 2019, "price": 340,
+            "qty": 800, "thesis": "Large-cap media, dividend yield play",
+        },
+        {
+            "ticker": "ZEEL", "action": "BUY", "year": 2020, "price": 175,
+            "qty": 500, "thesis": "Averaging down (bias: sunk cost fallacy)",
+            "bias": "sunk_cost",
+        },
+        {
+            "ticker": "ZEEL", "action": "BUY", "year": 2022, "price": 220,
+            "qty": 300, "thesis": "Sony merger optimism (bias: sunk cost fallacy)",
+            "bias": "sunk_cost",
+        },
+        {
+            "ticker": "DBL", "action": "BUY", "year": 2021, "price": 580,
+            "qty": 600, "thesis": "Infrastructure capex supercycle, record order book",
+        },
+        {
+            "ticker": "DBL", "action": "HOLD", "year": 2022, "price": 370,
+            "qty": 600, "thesis": "Holding through cycle turn (bias: cyclical trap)",
+            "bias": "cyclical_trap",
+        },
+    ]
+
+# Legacy compatibility
+HISTORICAL_TRADES = get_historical_trades()
 
 # ─── Sample RAG Documents (analyst notes + concall excerpts) ──────────────────
 SAMPLE_ANALYST_DOCS = [

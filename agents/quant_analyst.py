@@ -1,19 +1,20 @@
 """
-agents/quant_analyst.py
 Agent 1 — Quant Analyst
 Computes all numerical metrics and WISDOM scores.
 Uses Tool-Calling so the LLM never performs arithmetic — it calls Python functions.
+Now integrates real trade history with cost-basis-aware signals.
 """
 
 from __future__ import annotations
 
 import json
 from dataclasses import dataclass, field
+from datetime import datetime
 from typing import Any, Dict, List, Optional
 
 import anthropic
 
-from config import ANTHROPIC_API_KEY, LLM_MODEL, PORTFOLIO_STOCKS, TRIGGERS
+from config import ANTHROPIC_API_KEY, LLM_MODEL, PORTFOLIO_STOCKS, TRIGGERS, get_trade_ledger
 from data.market_data import FundamentalSnapshot, MarketDataFetcher
 from scoring.wisdom_scorer import WisdomScorer, WisdomScoreResult
 
@@ -35,6 +36,20 @@ QUANT_TOOLS: List[Dict] = [
         },
     },
     {
+        "name": "get_position_info",
+        "description": (
+            "Fetch the current position, cost basis, and P&L for a stock ticker from the real trade ledger. "
+            "Returns avg cost, quantity held, unrealised P&L, holding period, and realised P&L."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "ticker": {"type": "string", "description": "Stock ticker (e.g. AMBER, ZEEL)"}
+            },
+            "required": ["ticker"],
+        },
+    },
+    {
         "name": "compute_wisdom_score",
         "description": (
             "Compute the WISDOM 5-principle score (0–10) for a stock using its fundamental data. "
@@ -44,7 +59,7 @@ QUANT_TOOLS: List[Dict] = [
         "input_schema": {
             "type": "object",
             "properties": {
-                "ticker":      {"type": "string"},
+                "ticker": {"type": "string"},
                 "macro_shock": {"type": "boolean", "description": "True if a macro/systemic shock is occurring"},
             },
             "required": ["ticker"],
@@ -76,12 +91,28 @@ QUANT_TOOLS: List[Dict] = [
 
 
 @dataclass
+class PositionInfo:
+    """Real position data from trade ledger."""
+    ticker: str
+    qty_held: float
+    avg_cost: float
+    total_invested: float
+    realised_pnl: float
+    unrealised_pnl: float
+    unrealised_pnl_pct: float
+    holding_days: int
+    first_buy_date: Optional[str] = None
+    trade_count: int = 0
+
+
+@dataclass
 class QuantAnalystOutput:
     ticker: str
     snapshot: Optional[FundamentalSnapshot] = None
     score_result: Optional[WisdomScoreResult] = None
+    position_info: Optional[PositionInfo] = None
     sell_triggers: Dict[str, Any] = field(default_factory=dict)
-    buy_triggers:  Dict[str, Any] = field(default_factory=dict)
+    buy_triggers: Dict[str, Any] = field(default_factory=dict)
     agent_summary: str = ""
     tool_calls_made: List[str] = field(default_factory=list)
 
@@ -91,11 +122,12 @@ class QuantAnalystAgent:
     Agent 1: Quant Analyst
     Uses Anthropic tool-calling so the LLM orchestrates analysis
     without ever performing arithmetic itself.
+    Now includes real position data from trade ledger.
     """
 
     def __init__(self):
         self.fetcher = MarketDataFetcher()
-        self.scorer  = WisdomScorer()
+        self.scorer = WisdomScorer()
         self._snapshots: Dict[str, FundamentalSnapshot] = {}
         self.client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY) if ANTHROPIC_API_KEY else None
 
@@ -107,10 +139,11 @@ class QuantAnalystAgent:
 
         if not self.client:
             # Offline mode — run tools directly without LLM orchestration
-            output.snapshot    = self._tool_get_snapshot(ticker)
+            output.snapshot = self._tool_get_snapshot(ticker)
             output.score_result = self._tool_compute_score(ticker, macro_shock)
             output.sell_triggers = self._tool_check_sell(ticker)
-            output.buy_triggers  = self._tool_check_buy(ticker)
+            output.buy_triggers = self._tool_check_buy(ticker)
+            output.position_info = self._tool_get_position_info(ticker)
             output.agent_summary = self._offline_summary(output)
             return output
 
@@ -123,9 +156,10 @@ class QuantAnalystAgent:
                     f"macro_shock={macro_shock}. "
                     "Use the available tools to: "
                     "1) fetch fundamental data, "
-                    "2) compute WISDOM score, "
-                    "3) check sell triggers, "
-                    "4) check buy triggers. "
+                    "2) fetch position/cost basis info, "
+                    "3) compute WISDOM score, "
+                    "4) check sell triggers, "
+                    "5) check buy triggers. "
                     "Then provide a concise quant summary (3–5 bullet points). "
                     "IMPORTANT: never compute any numbers yourself — always call the tools."
                 ),
@@ -161,12 +195,14 @@ class QuantAnalystAgent:
                 # Cache structured outputs
                 if block.name == "get_fundamental_snapshot":
                     output.snapshot = self._snapshots.get(ticker)
+                elif block.name == "get_position_info":
+                    output.position_info = result_data.get("_obj")
                 elif block.name == "compute_wisdom_score":
                     output.score_result = result_data.get("_obj")
                 elif block.name == "check_sell_triggers":
                     output.sell_triggers = result_data
                 elif block.name == "check_buy_triggers":
-                    output.buy_triggers  = result_data
+                    output.buy_triggers = result_data
 
                 tool_results.append({
                     "type": "tool_result",
@@ -176,7 +212,7 @@ class QuantAnalystAgent:
 
             # Feed tool results back into conversation
             messages.append({"role": "assistant", "content": resp.content})
-            messages.append({"role": "user",      "content": tool_results})
+            messages.append({"role": "user", "content": tool_results})
 
         return output
 
@@ -186,6 +222,8 @@ class QuantAnalystAgent:
         t = inputs.get("ticker", ticker)
         if name == "get_fundamental_snapshot":
             return self._tool_get_snapshot_dict(t)
+        if name == "get_position_info":
+            return self._tool_get_position_info_dict(t)
         if name == "compute_wisdom_score":
             return self._tool_compute_score_dict(t, inputs.get("macro_shock", macro_shock))
         if name == "check_sell_triggers":
@@ -216,6 +254,74 @@ class QuantAnalystAgent:
             "pe_ratio": s.pe_ratio, "peg_ratio": s.peg_ratio,
             "price": s.price, "market_cap_cr": s.market_cap_cr,
             "fetch_error": s.fetch_error,
+        }
+
+    def _tool_get_position_info(self, ticker: str) -> Optional[PositionInfo]:
+        """Fetch real position data from trade ledger."""
+        try:
+            ledger = get_trade_ledger()
+            position = ledger.get_position(ticker)
+            
+            if not position or position.qty <= 0:
+                return PositionInfo(
+                    ticker=ticker,
+                    qty_held=0.0,
+                    avg_cost=0.0,
+                    total_invested=0.0,
+                    realised_pnl=position.realised_pnl if position else 0.0,
+                    unrealised_pnl=0.0,
+                    unrealised_pnl_pct=0.0,
+                    holding_days=0,
+                )
+            
+            # Get current market price for unrealised P&L
+            snap = self._tool_get_snapshot(ticker)
+            current_price = snap.price if snap and snap.price else position.avg_cost
+            
+            # Calculate holding period from first buy
+            trades = ledger.get_trade_history(ticker)
+            buy_trades = [t for t in trades if t.side == "BUY"]
+            first_buy_date = min(t.date for t in buy_trades) if buy_trades else None
+            holding_days = (datetime.now() - first_buy_date).days if first_buy_date else 0
+            
+            unrealised_pnl = position.unrealised_pnl(current_price)
+            unrealised_pnl_pct = position.pnl_percentage(current_price)
+            
+            return PositionInfo(
+                ticker=ticker,
+                qty_held=position.qty,
+                avg_cost=position.avg_cost,
+                total_invested=position.total_invested,
+                realised_pnl=position.realised_pnl,
+                unrealised_pnl=unrealised_pnl,
+                unrealised_pnl_pct=unrealised_pnl_pct,
+                holding_days=holding_days,
+                first_buy_date=first_buy_date.strftime("%Y-%m-%d") if first_buy_date else None,
+                trade_count=len(buy_trades),
+            )
+        except Exception as e:
+            print(f"⚠️  Could not load position info for {ticker}: {e}")
+            return None
+
+    def _tool_get_position_info_dict(self, ticker: str) -> dict:
+        """Return position info as dict for tool result."""
+        pos = self._tool_get_position_info(ticker)
+        if not pos:
+            return {"ticker": ticker, "position_found": False}
+        
+        return {
+            "_obj": pos,
+            "ticker": pos.ticker,
+            "position_found": True,
+            "qty_held": pos.qty_held,
+            "avg_cost": pos.avg_cost,
+            "total_invested": pos.total_invested,
+            "realised_pnl": pos.realised_pnl,
+            "unrealised_pnl": pos.unrealised_pnl,
+            "unrealised_pnl_pct": pos.unrealised_pnl_pct,
+            "holding_days": pos.holding_days,
+            "first_buy_date": pos.first_buy_date,
+            "trade_count": pos.trade_count,
         }
 
     def _tool_compute_score(self, ticker: str, macro_shock: bool = False) -> WisdomScoreResult:
@@ -265,11 +371,11 @@ class QuantAnalystAgent:
         s = self._tool_get_snapshot(ticker)
         r = self._tool_compute_score(ticker)
         return {
-            "wisdom_score_ok":  r.total_score >= TRIGGERS.buy_wisdom_score_min,
-            "peg_ok":           (s.peg_ratio or 99) <= TRIGGERS.buy_peg_max,
-            "wisdom_score":     r.total_score,
-            "peg_ratio":        s.peg_ratio,
-            "buy_eligible":     r.total_score >= TRIGGERS.buy_wisdom_score_min and (s.peg_ratio or 99) <= TRIGGERS.buy_peg_max,
+            "wisdom_score_ok": r.total_score >= TRIGGERS.buy_wisdom_score_min,
+            "peg_ok": (s.peg_ratio or 99) <= TRIGGERS.buy_peg_max,
+            "wisdom_score": r.total_score,
+            "peg_ratio": s.peg_ratio,
+            "buy_eligible": r.total_score >= TRIGGERS.buy_wisdom_score_min and (s.peg_ratio or 99) <= TRIGGERS.buy_peg_max,
         }
 
     def _offline_summary(self, output: QuantAnalystOutput) -> str:
@@ -278,7 +384,16 @@ class QuantAnalystAgent:
             return "No score computed."
         lines = [f"WISDOM Score: {r.total_score}/10 → {r.signal}"]
         for p in r.principles:
-            lines.append(f"  • P{p.principle_id} {p.name}: {p.score}/10")
+            lines.append(f" • P{p.principle_id} {p.name}: {p.score}/10")
         if r.trigger_reason:
             lines.append(f"Trigger: {r.trigger_reason}")
+        
+        # Add position info if available
+        pos = output.position_info
+        if pos and pos.qty_held > 0:
+            pnl_sign = "+" if pos.unrealised_pnl >= 0 else ""
+            lines.append(f"\n📊 Position: {pos.qty_held:,.0f} shares @ ₹{pos.avg_cost:.2f} avg")
+            lines.append(f"   Unrealised P&L: {pnl_sign}₹{pos.unrealised_pnl:,.0f} ({pnl_sign}{pos.unrealised_pnl_pct:.1f}%)")
+            lines.append(f"   Holding: {pos.holding_days} days | Realised P&L: ₹{pos.realised_pnl:,.0f}")
+        
         return "\n".join(lines)

@@ -1,8 +1,8 @@
 """
-agents/portfolio_manager.py
 Agent 4 — Portfolio Manager (Orchestrator)
 Synthesises outputs from Agents 1–3 and produces a Trade Recommendation Memo.
 Uses the LLM for final narrative synthesis. Human sign-off is required before execution.
+Now references real trade data in memos (buy price, P&L %, holding period).
 """
 
 from __future__ import annotations
@@ -14,7 +14,7 @@ from typing import Dict, List, Optional
 
 import anthropic
 
-from config import ANTHROPIC_API_KEY, AUM_INR_CRORES, LLM_MODEL, PORTFOLIO_STOCKS
+from config import ANTHROPIC_API_KEY, AUM_INR_CRORES, LLM_MODEL, PORTFOLIO_STOCKS, get_trade_ledger
 from agents.quant_analyst import QuantAnalystOutput
 from agents.qual_researcher import QualResearchOutput
 from agents.risk_manager import RiskAssessmentOutput, RiskFlag
@@ -27,8 +27,8 @@ class TradeRecommendationMemo:
 
     ticker: str
     stock_name: str
-    recommendation: str              # BUY | HOLD | SELL | WATCH
-    urgency: str                     # HIGH | MEDIUM | LOW
+    recommendation: str  # BUY | HOLD | SELL | WATCH
+    urgency: str  # HIGH | MEDIUM | LOW
     wisdom_score: float
     generated_at: str = ""
 
@@ -40,8 +40,16 @@ class TradeRecommendationMemo:
     bias_override_applied: bool = False
     anti_panic_active: bool = False
 
+    # Real trade data context
+    position_context: str = ""
+    avg_cost: float = 0.0
+    unrealised_pnl: float = 0.0
+    unrealised_pnl_pct: float = 0.0
+    holding_days: int = 0
+    realised_pnl: float = 0.0
+
     # HITL state
-    approved: Optional[bool] = None   # None = pending, True = approved, False = rejected
+    approved: Optional[bool] = None  # None = pending, True = approved, False = rejected
     approved_by: Optional[str] = None
     approved_at: Optional[str] = None
 
@@ -54,16 +62,22 @@ class TradeRecommendationMemo:
             "risk_note": self.risk_note,
             "bias_override": self.bias_override_applied,
             "anti_panic": self.anti_panic_active,
+            "position_context": self.position_context,
+            "avg_cost": self.avg_cost,
+            "unrealised_pnl": self.unrealised_pnl,
+            "unrealised_pnl_pct": self.unrealised_pnl_pct,
+            "holding_days": self.holding_days,
+            "realised_pnl": self.realised_pnl,
             "hitl_status": "PENDING" if self.approved is None else ("APPROVED" if self.approved else "REJECTED"),
         }
 
     def approve(self, by: str = "Fund Manager") -> None:
-        self.approved    = True
+        self.approved = True
         self.approved_by = by
         self.approved_at = datetime.now().isoformat()
 
     def reject(self, by: str = "Fund Manager") -> None:
-        self.approved    = False
+        self.approved = False
         self.approved_by = by
         self.approved_at = datetime.now().isoformat()
 
@@ -90,6 +104,7 @@ class PortfolioManagerAgent:
     Agent 4: Portfolio Manager (WISDOM-PM Orchestrator)
     Runs all 3 sub-agents in sequence and synthesises a Trade Recommendation Memo
     for every stock in the portfolio.
+    Now uses real trade data for memo context.
     """
 
     def __init__(self):
@@ -98,21 +113,21 @@ class PortfolioManagerAgent:
     def generate_memos(
         self,
         quant_outputs: Dict[str, QuantAnalystOutput],
-        qual_outputs:  Dict[str, QualResearchOutput],
-        risk_output:   RiskAssessmentOutput,
+        qual_outputs: Dict[str, QualResearchOutput],
+        risk_output: RiskAssessmentOutput,
     ) -> PMOrchestrationOutput:
 
         result = PMOrchestrationOutput()
 
         for ticker in PORTFOLIO_STOCKS:
-            qn  = quant_outputs.get(ticker)
-            ql  = qual_outputs.get(ticker)
+            qn = quant_outputs.get(ticker)
+            ql = qual_outputs.get(ticker)
             risk_flags = [f for f in risk_output.flags if f.stock == ticker]
 
             memo = self._build_memo(ticker, qn, ql, risk_flags, risk_output)
             result.memos.append(memo)
 
-        result.portfolio_summary  = self._portfolio_summary(quant_outputs, risk_output)
+        result.portfolio_summary = self._portfolio_summary(quant_outputs, risk_output)
         result.step1_profile_summary = self._step1_summary()
         result.step2_decision_summary = self._step2_summary(quant_outputs)
         result.step3_architecture_note = self._step3_note()
@@ -131,10 +146,10 @@ class PortfolioManagerAgent:
     ) -> TradeRecommendationMemo:
 
         score_result = qn.score_result if qn else None
-        snap         = qn.snapshot     if qn else None
-        signal       = score_result.signal if score_result else "WATCH"
-        wisdom       = score_result.total_score if score_result else 0.0
-        stock_cfg    = PORTFOLIO_STOCKS.get(ticker, {})
+        snap = qn.snapshot if qn else None
+        signal = score_result.signal if score_result else "WATCH"
+        wisdom = score_result.total_score if score_result else 0.0
+        stock_cfg = PORTFOLIO_STOCKS.get(ticker, {})
 
         memo = TradeRecommendationMemo(
             ticker=ticker,
@@ -146,15 +161,39 @@ class PortfolioManagerAgent:
             anti_panic_active=score_result.anti_panic_active if score_result else False,
         )
 
+        # Add real position data
+        pos_info = qn.position_info if qn else None
+        if pos_info:
+            memo.avg_cost = pos_info.avg_cost
+            memo.unrealised_pnl = pos_info.unrealised_pnl
+            memo.unrealised_pnl_pct = pos_info.unrealised_pnl_pct
+            memo.holding_days = pos_info.holding_days
+            memo.realised_pnl = pos_info.realised_pnl
+            
+            if pos_info.qty_held > 0:
+                pnl_sign = "+" if pos_info.unrealised_pnl >= 0 else ""
+                memo.position_context = (
+                    f"Holding {pos_info.qty_held:,.0f} shares @ ₹{pos_info.avg_cost:.2f} avg cost. "
+                    f"Unrealised P&L: {pnl_sign}₹{pos_info.unrealised_pnl:,.0f} ({pnl_sign}{pos_info.unrealised_pnl_pct:.1f}%). "
+                    f"Holding period: {pos_info.holding_days} days. "
+                    f"Realised P&L: ₹{pos_info.realised_pnl:,.0f}."
+                )
+            else:
+                memo.position_context = (
+                    f"Fully exited. Realised P&L: ₹{pos_info.realised_pnl:,.0f}."
+                )
+
         # Agent syntheses
         if qn and score_result:
-            memo.agent_syntheses.append(
-                f"[Agent 1 — Quant] WISDOM {wisdom:.1f}/10. "
-                + " | ".join(
-                    f"P{p.principle_id}: {p.score:.1f}"
-                    for p in score_result.principles
-                )
+            synth = f"[Agent 1 — Quant] WISDOM {wisdom:.1f}/10. "
+            synth += " | ".join(
+                f"P{p.principle_id}: {p.score:.1f}"
+                for p in score_result.principles
             )
+            if pos_info and pos_info.qty_held > 0:
+                synth += f" | Position: {pos_info.qty_held:,.0f} shares @ ₹{pos_info.avg_cost:.2f}"
+            memo.agent_syntheses.append(synth)
+        
         if ql:
             memo.agent_syntheses.append(
                 f"[Agent 2 — Qual] Sentiment: {ql.analyst_sentiment.upper()}. "
@@ -174,7 +213,7 @@ class PortfolioManagerAgent:
             )
         else:
             memo.rationale, memo.instruction, memo.risk_note = self._rule_based_narrative(
-                ticker, signal, wisdom, snap, ql, risk_flags, score_result
+                ticker, signal, wisdom, snap, ql, risk_flags, score_result, pos_info
             )
 
         # Bias override flag
@@ -196,13 +235,19 @@ class PortfolioManagerAgent:
             "risk_flags": [f.description for f in risk_flags],
             "qual_sentiment": ql.analyst_sentiment if ql else "unknown",
             "thesis_intact": ql.thesis_intact if ql else True,
+            "position_context": memo.position_context,
+            "avg_cost": memo.avg_cost,
+            "unrealised_pnl": memo.unrealised_pnl,
+            "unrealised_pnl_pct": memo.unrealised_pnl_pct,
+            "holding_days": memo.holding_days,
+            "realised_pnl": memo.realised_pnl,
         }
         prompt = (
             f"You are the Portfolio Manager for WISDOM-PM, a disciplined Indian equity fund. "
             f"Based on the following analysis inputs, write a Trade Recommendation Memo for {ticker}.\n\n"
             f"Inputs: {json.dumps(context, indent=2)}\n\n"
             "Write exactly three sections:\n"
-            "RATIONALE: (1–2 sentences explaining WHY this recommendation)\n"
+            "RATIONALE: (1–2 sentences explaining WHY this recommendation, referencing real cost basis and P&L)\n"
             "INSTRUCTION: (precise, actionable order instruction for the fund manager)\n"
             "RISK NOTE: (1–2 sentences on the key risk or caveat)\n\n"
             "Be concise and professional. No preamble."
@@ -227,42 +272,80 @@ class PortfolioManagerAgent:
             return self._rule_based_narrative(
                 ticker, memo.recommendation, memo.wisdom_score,
                 qn.snapshot if qn else None, None, risk_flags,
-                qn.score_result if qn else None
+                qn.score_result if qn else None,
+                qn.position_info if qn else None
             )
 
-    def _rule_based_narrative(self, ticker, signal, wisdom, snap, ql, risk_flags, score_result) -> tuple[str, str, str]:
+    def _rule_based_narrative(
+        self, ticker, signal, wisdom, snap, ql, risk_flags, score_result, pos_info=None
+    ) -> tuple[str, str, str]:
         alloc = PORTFOLIO_STOCKS.get(ticker, {}).get("allocation_pct", 0)
         aum_amt = AUM_INR_CRORES * alloc / 100
+        
+        # Position context for narrative
+        pos_ctx = ""
+        if pos_info and pos_info.qty_held > 0:
+            pnl_sign = "+" if pos_info.unrealised_pnl >= 0 else ""
+            pos_ctx = (
+                f" Current position: {pos_info.qty_held:,.0f} shares @ ₹{pos_info.avg_cost:.2f} avg, "
+                f"unrealised P&L {pnl_sign}₹{pos_info.unrealised_pnl:,.0f} ({pnl_sign}{pos_info.unrealised_pnl_pct:.1f}%), "
+                f"held for {pos_info.holding_days} days."
+            )
 
         if signal == "SELL":
-            rationale  = (f"WISDOM score {wisdom:.1f}/10 indicates structural deterioration. "
-                          f"{'Thesis break confirmed in analyst corpus. ' if ql and not ql.thesis_intact else ''}"
-                          "Continuing to hold risks further capital destruction.")
-            instruction = (f"Exit 100% of {ticker} position (₹{aum_amt:.1f} Cr) at market on next trading session. "
-                           "Proceeds to cash pending redeployment in higher-conviction ideas.")
-            risk_note   = "Sunk-cost bias override applied — do not average down."
+            rationale = (
+                f"WISDOM score {wisdom:.1f}/10 indicates structural deterioration. "
+                f"{'Thesis break confirmed in analyst corpus. ' if ql and not ql.thesis_intact else ''}"
+                f"Continuing to hold risks further capital destruction.{pos_ctx}"
+            )
+            if pos_info and pos_info.qty_held > 0:
+                instruction = (
+                    f"Exit 100% of {ticker} position ({pos_info.qty_held:,.0f} shares, ₹{aum_amt:.1f} Cr) "
+                    f"at market on next trading session. "
+                    f"Realised P&L impact: ₹{pos_info.unrealised_pnl:,.0f}."
+                )
+            else:
+                instruction = (
+                    f"Exit 100% of {ticker} position (₹{aum_amt:.1f} Cr) at market on next trading session. "
+                    "Proceeds to cash pending redeployment in higher-conviction ideas."
+                )
+            risk_note = "Sunk-cost bias override applied — do not average down."
 
         elif signal == "BUY":
-            rationale  = (f"WISDOM score {wisdom:.1f}/10 — all 5 principles satisfied. "
-                          f"{'Analyst sentiment bullish. ' if ql and ql.analyst_sentiment == 'bullish' else ''}"
-                          "Structural thesis intact with reinvestment runway visible.")
-            instruction = (f"Add to {ticker} position. Increase allocation to {min(alloc + 5, 40)}% of AUM. "
-                           "Buy in tranches over 5 trading days to average entry.")
-            risk_note   = "Do not chase momentum. Entry only at or below current market price."
+            rationale = (
+                f"WISDOM score {wisdom:.1f}/10 — all 5 principles satisfied. "
+                f"{'Analyst sentiment bullish. ' if ql and ql.analyst_sentiment == 'bullish' else ''}"
+                f"Structural thesis intact with reinvestment runway visible.{pos_ctx}"
+            )
+            instruction = (
+                f"Add to {ticker} position. Increase allocation to {min(alloc + 5, 40)}% of AUM. "
+                "Buy in tranches over 5 trading days to average entry."
+            )
+            risk_note = "Do not chase momentum. Entry only at or below current market price."
 
         elif signal == "HOLD":
             anti = score_result and score_result.anti_panic_active
-            rationale  = ("Anti-panic mechanism active — macro shock detected but fundamentals intact. "
-                          if anti else
-                          f"WISDOM score {wisdom:.1f}/10 — thesis intact. No action required.")
-            instruction = f"Hold existing {ticker} position ({alloc}% of AUM = ₹{aum_amt:.1f} Cr). No trade."
-            risk_note   = ("Portfolio frozen until macro shock resolves. Monitor ROCE quarterly."
-                           if anti else "Review on next quarterly earnings.")
+            if anti:
+                rationale = (
+                    "Anti-panic mechanism active — macro shock detected but fundamentals intact. "
+                    f"Despite short-term volatility, business quality remains strong.{pos_ctx}"
+                )
+                instruction = f"Hold existing {ticker} position ({alloc}% of AUM = ₹{aum_amt:.1f} Cr). No trade."
+                risk_note = "Portfolio frozen until macro shock resolves. Monitor ROCE quarterly."
+            else:
+                rationale = (
+                    f"WISDOM score {wisdom:.1f}/10 — thesis intact. No action required.{pos_ctx}"
+                )
+                instruction = f"Hold existing {ticker} position ({alloc}% of AUM = ₹{aum_amt:.1f} Cr). No trade."
+                risk_note = "Review on next quarterly earnings."
+
         else:  # WATCH
-            rationale  = (f"WISDOM score {wisdom:.1f}/10 — below HOLD threshold. "
-                          "Metrics trending in wrong direction but no hard sell trigger yet.")
+            rationale = (
+                f"WISDOM score {wisdom:.1f}/10 — below HOLD threshold. "
+                f"Metrics trending in wrong direction but no hard sell trigger yet.{pos_ctx}"
+            )
             instruction = f"Reduce {ticker} allocation from {alloc}% to {max(alloc - 5, 10)}% of AUM on strength."
-            risk_note   = f"Set alert: SELL if ROCE drops below 10% or D/E crosses 1.5."
+            risk_note = f"Set alert: SELL if ROCE drops below 10% or D/E crosses 1.5."
 
         return rationale, instruction, risk_note
 
@@ -277,25 +360,57 @@ class PortfolioManagerAgent:
 
     def _portfolio_summary(self, quant: Dict, risk: RiskAssessmentOutput) -> str:
         scores = {t: q.score_result.total_score for t, q in quant.items() if q.score_result}
-        avg    = sum(scores.values()) / len(scores) if scores else 0
-        lines  = [
-            f"AUM: ₹{AUM_INR_CRORES} Crores  |  Avg WISDOM Score: {avg:.1f}/10",
+        avg = sum(scores.values()) / len(scores) if scores else 0
+        
+        # Get real portfolio P&L from ledger
+        try:
+            ledger = get_trade_ledger()
+            summary = ledger.get_portfolio_summary()
+            total_realised = summary["total_realised_pnl"]
+            open_count = summary["open_positions_count"]
+        except Exception:
+            total_realised = 0
+            open_count = 0
+        
+        lines = [
+            f"AUM: ₹{AUM_INR_CRORES} Crores | Avg WISDOM Score: {avg:.1f}/10",
             f"Portfolio Risk Score: {risk.portfolio_risk_score}/10",
             f"Cyclical Exposure: {risk.cyclical_exposure_pct:.0f}%",
-            "Signals: " + "  ".join(
+            f"Realised P&L (from trade ledger): ₹{total_realised:,.0f}",
+            f"Open positions: {open_count}",
+            "Signals: " + " ".join(
                 f"{t}={q.score_result.signal}" for t, q in quant.items() if q.score_result
             ),
         ]
         return "\n".join(lines)
 
     def _step1_summary(self) -> str:
-        return (
-            "Step 1 — Investor Profiling Complete.\n"
-            "Strengths  : Exceptional patience on structural themes (AMBER 8-year hold).\n"
-            "Bias 1     : Macro Panic — sold WELSPUN at ₹21 (–70%) during Covid.\n"
-            "Bias 2     : Sunk Cost  — averaged down ZEEL through structural decline.\n"
-            "Bias 3     : Cyclical Trap — misread DBL order-book peak as structural growth."
-        )
+        try:
+            ledger = get_trade_ledger()
+            summary = ledger.get_portfolio_summary()
+            biases = ledger.detect_biases()
+            
+            bias_lines = []
+            for ticker, ticker_biases in biases.items():
+                for b in ticker_biases:
+                    bias_lines.append(f"   • {ticker}: {b['description']}")
+            
+            bias_text = "\n".join(bias_lines) if bias_lines else "   No algorithmic biases detected."
+            
+            return (
+                f"Step 1 — Investor Profiling Complete (from real trade ledger).\n"
+                f"Total trades: {summary['total_trades']} | Completed pairs: {summary['completed_pairs']}\n"
+                f"Realised P&L: ₹{summary['total_realised_pnl']:,.0f}\n"
+                f"Detected biases:\n{bias_text}"
+            )
+        except Exception as e:
+            return (
+                "Step 1 — Investor Profiling Complete.\n"
+                "Strengths : Exceptional patience on structural themes (AMBER 8-year hold).\n"
+                "Bias 1 : Macro Panic — sold WELSPUN at ₹21 (–70%) during Covid.\n"
+                "Bias 2 : Sunk Cost — averaged down ZEEL through structural decline.\n"
+                "Bias 3 : Cyclical Trap — misread DBL order-book peak as structural growth."
+            )
 
     def _step2_summary(self, quant: Dict) -> str:
         lines = ["Step 2 — WISDOM Decision Matrix Results:"]
@@ -303,17 +418,18 @@ class PortfolioManagerAgent:
             if q.score_result:
                 lines.append(
                     f"  {ticker:10s}: {q.score_result.total_score:.1f}/10 → {q.score_result.signal}"
-                    + (f"  [anti-panic]" if q.score_result.anti_panic_active else "")
+                    + (f" [anti-panic]" if q.score_result.anti_panic_active else "")
                 )
         return "\n".join(lines)
 
     def _step3_note(self) -> str:
         return (
             "Step 3 — Architecture:\n"
-            "  Data     : Yahoo Finance / Screener.in → ETL → PostgreSQL + S3\n"
-            "  RAG      : Analyst PDFs + Concalls → ChromaDB vector store\n"
-            "  Agents   : LangGraph (Quant → Qual → Risk → PM)\n"
+            "  Data    : Yahoo Finance / Screener.in → ETL → PostgreSQL + S3\n"
+            "  Trade   : Excel ledger → TradeLedger parser → Real P&L & cost basis\n"
+            "  RAG     : Analyst PDFs + Concalls → ChromaDB vector store\n"
+            "  Agents  : LangGraph (Quant → Qual → Risk → PM)\n"
             "  Guardrail: LLM never computes numbers — Tool-Calling only\n"
-            "  Privacy  : Trade history never leaves encrypted on-premise DB\n"
-            "  HITL     : All memos require digital sign-off before execution"
+            "  Privacy : Trade history never leaves encrypted on-premise DB\n"
+            "  HITL    : All memos require digital sign-off before execution"
         )

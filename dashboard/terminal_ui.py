@@ -1,7 +1,7 @@
 """
-dashboard/terminal_ui.py
 Rich-powered terminal dashboard for WISDOM-PM.
 Renders all 3 steps, scores, memos, and HITL approval workflow.
+Now displays real trade history from Excel ledger.
 """
 
 from __future__ import annotations
@@ -30,13 +30,12 @@ console = Console()
 
 # ── Colour palette ─────────────────────────────────────────────────────────────
 SIGNAL_STYLE = {
-    "BUY":   "bold green",
-    "HOLD":  "bold blue",
-    "SELL":  "bold red",
+    "BUY": "bold green",
+    "HOLD": "bold blue",
+    "SELL": "bold red",
     "WATCH": "bold yellow",
 }
 SEV_STYLE = {"HIGH": "bold red", "MEDIUM": "yellow", "LOW": "dim cyan"}
-
 
 # ── Header ─────────────────────────────────────────────────────────────────────
 
@@ -46,7 +45,7 @@ def print_header() -> None:
         Panel(
             Align.center(
                 Text.assemble(
-                    ("  WISDOM–PM  ", "bold gold1 on black"),
+                    (" WISDOM–PM ", "bold gold1 on black"),
                     ("\n", ""),
                     ("Intelligent Portfolio Management System", "dim"),
                     ("\nQuant · RAG · Multi-Agent · Human-in-the-Loop", "italic dim"),
@@ -57,45 +56,122 @@ def print_header() -> None:
         )
     )
 
-
 # ── Step 1: Investor Profile ────────────────────────────────────────────────────
 
 def print_step1(orch: "WisdomPMOrchestrator") -> None:
     console.print(Rule("[bold gold1]STEP 1 — Historical Trade Analysis & Investor Profiling[/]"))
 
-    from config import HISTORICAL_TRADES, IDENTIFIED_BIASES
+    from config import get_trade_ledger, get_identified_biases
+
+    # Get real trade ledger
+    try:
+        ledger = get_trade_ledger()
+        trades = ledger.get_trade_history()
+        positions = ledger.get_all_positions()
+        summary = ledger.get_portfolio_summary()
+        using_real_data = True
+    except Exception as e:
+        console.print(f"[yellow]⚠️  Using fallback demo data: {e}[/]")
+        from config import HISTORICAL_TRADES
+        trades = HISTORICAL_TRADES
+        using_real_data = False
+
+    # Portfolio summary panel
+    if using_real_data:
+        console.print(Panel(
+            f"[bold]Real Trade Ledger Loaded[/]\n"
+            f"Total trades: {summary['total_trades']} | Completed pairs: {summary['completed_pairs']}\n"
+            f"Realised P&L: ₹{summary['total_realised_pnl']:,.0f}\n"
+            f"Open positions: {summary['open_positions_count']}",
+            title="📊 Portfolio Summary",
+            border_style="green",
+        ))
+        console.print()
 
     # Trade history table
-    table = Table(title="10-Year Trade History", box=box.SIMPLE_HEAVY, border_style="dim")
-    table.add_column("Ticker",  style="bold cyan",    width=10)
-    table.add_column("Action",  justify="center",     width=8)
-    table.add_column("Year",    justify="center",     width=6)
-    table.add_column("Price ₹", justify="right",      width=10)
-    table.add_column("Qty",     justify="right",      width=7)
-    table.add_column("Thesis / Note",                 width=55)
+    table = Table(title="Trade History (from Excel Ledger)" if using_real_data else "Trade History (Demo Data)", 
+                  box=box.SIMPLE_HEAVY, border_style="dim")
+    table.add_column("Ticker", style="bold cyan", width=10)
+    table.add_column("Action", justify="center", width=8)
+    table.add_column("Date", justify="center", width=12)
+    table.add_column("Price ₹", justify="right", width=10)
+    table.add_column("Qty", justify="right", width=10)
+    table.add_column("Thesis / Note", width=55)
 
     action_style = {"BUY": "green", "SELL": "red", "HOLD": "blue"}
 
-    for t in HISTORICAL_TRADES:
-        bias_tag = f"  [red][BIAS: {t['bias'].upper()}][/]" if "bias" in t else ""
-        table.add_row(
-            t["ticker"],
-            f"[{action_style.get(t['action'], 'white')}]{t['action']}[/]",
-            str(t["year"]),
-            f"{t['price']:,}",
-            str(t["qty"]),
-            t["thesis"][:55] + bias_tag,
-        )
+    if using_real_data:
+        # Show real trades from ledger
+        for t in trades:
+            bias_tag = ""
+            # Check if this trade is part of a detected bias
+            biases = ledger.detect_biases()
+            ticker_biases = biases.get(t.ticker, [])
+            for b in ticker_biases:
+                if b["type"] == "MACRO_PANIC" and t.side == "SELL":
+                    if abs((t.date - b["date"]).days) <= 1:
+                        bias_tag = " [red][BIAS: MACRO_PANIC][/]"
+                elif b["type"] == "SUNK_COST" and t.side == "BUY":
+                    bias_tag = " [yellow][BIAS: SUNK_COST][/]"
+                elif b["type"] == "CYCLICAL_TRAP" and t.side == "SELL":
+                    bias_tag = " [red][BIAS: CYCLICAL_TRAP][/]"
+            
+            table.add_row(
+                t.ticker,
+                f"[{action_style.get(t.side, 'white')}] {t.side}[/]",
+                t.date.strftime("%Y-%m-%d"),
+                f"{t.rate:,.2f}",
+                f"{t.qty:,.0f}",
+                f"{t.side} at ₹{t.rate:.2f}"[:55] + bias_tag,
+            )
+    else:
+        # Fallback to demo data format
+        for t in trades:
+            bias_tag = f" [red][BIAS: {t['bias'].upper()}][/]" if "bias" in t else ""
+            table.add_row(
+                t["ticker"],
+                f"[{action_style.get(t['action'], 'white')}] {t['action']}[/]",
+                str(t["year"]),
+                f"{t['price']:,}",
+                str(t["qty"]),
+                t["thesis"][:55] + bias_tag,
+            )
+    
     console.print(table)
     console.print()
 
-    # Bias profile
-    bias_table = Table(title="Identified Investor Biases", box=box.ROUNDED, border_style="red")
-    bias_table.add_column("Bias",         style="bold yellow", width=28)
-    bias_table.add_column("Stocks",       width=14)
-    bias_table.add_column("Mitigation",   width=52)
+    # Open positions table
+    if using_real_data and positions:
+        pos_table = Table(title="Open Positions (Currently Held)", box=box.ROUNDED, border_style="cyan")
+        pos_table.add_column("Ticker", style="bold cyan", width=10)
+        pos_table.add_column("Qty Held", justify="right", width=12)
+        pos_table.add_column("Avg Cost ₹", justify="right", width=12)
+        pos_table.add_column("Invested ₹", justify="right", width=14)
+        pos_table.add_column("Realised P&L", justify="right", width=14)
+        
+        for ticker, pos in positions.items():
+            if pos.qty > 0:
+                pnl_color = "green" if pos.realised_pnl >= 0 else "red"
+                pos_table.add_row(
+                    ticker,
+                    f"{pos.qty:,.0f}",
+                    f"{pos.avg_cost:,.2f}",
+                    f"₹{pos.total_invested:,.0f}",
+                    f"[{pnl_color}]₹{pos.realised_pnl:,.0f}[/]",
+                )
+        
+        if pos_table.rows:
+            console.print(pos_table)
+            console.print()
 
-    for bias_id, b in IDENTIFIED_BIASES.items():
+    # Bias profile
+    biases = get_identified_biases()
+    bias_table = Table(title="Identified Investor Biases (Algorithmic Detection)", box=box.ROUNDED, border_style="red")
+    bias_table.add_column("Bias", style="bold yellow", width=28)
+    bias_bias.add_column("Stocks", width=14)
+    bias_table.add_column("Mitigation", width=52)
+
+    for bias_id, b in biases.items():
         bias_table.add_row(
             b["name"],
             ", ".join(b["affected_stocks"]),
@@ -113,29 +189,30 @@ def print_step2(orch: "WisdomPMOrchestrator") -> None:
     for ticker, qn in orch.quant_outputs.items():
         if not qn.score_result:
             continue
-        r   = qn.score_result
-        ql  = orch.qual_outputs.get(ticker)
-        s   = qn.snapshot
+        r = qn.score_result
+        ql = orch.qual_outputs.get(ticker)
+        s = qn.snapshot
+        pos = qn.position_info
 
         sig_style = SIGNAL_STYLE.get(r.signal, "white")
 
         # Header panel
         header_text = Text.assemble(
-            (f"  {ticker}  ", "bold white on dark_blue"),
-            ("  ", ""),
+            (f" {ticker} ", "bold white on dark_blue"),
+            (" ", ""),
             (f"{r.total_score:.1f} / 10", "bold gold1"),
-            ("  →  ", "dim"),
+            (" → ", "dim"),
             (f"{r.signal}", sig_style),
         )
         if r.anti_panic_active:
-            header_text.append("  🔒 ANTI-PANIC LOCK", style="bold yellow")
+            header_text.append(" 🔒 ANTI-PANIC LOCK", style="bold yellow")
         console.print(Panel(header_text, expand=False))
 
         # Principles table
         p_table = Table(box=box.MINIMAL, show_header=True, border_style="dim")
         p_table.add_column("Principle", width=26)
         p_table.add_column("Score", justify="center", width=10)
-        p_table.add_column("Bar",   width=22)
+        p_table.add_column("Bar", width=22)
         p_table.add_column("Top Check", width=45)
 
         for p in r.principles:
@@ -161,14 +238,24 @@ def print_step2(orch: "WisdomPMOrchestrator") -> None:
                 f"Promoter: {s.promoter_holding:.1f}%" if s.promoter_holding else "",
                 f"PEG: {s.peg_ratio:.2f}" if s.peg_ratio else "",
             ]
-            console.print("  Quant: " + "  |  ".join(x for x in snap_items if x))
+            console.print("  Quant: " + " | ".join(x for x in snap_items if x))
+
+        # Position info (NEW)
+        if pos and pos.qty_held > 0:
+            pnl_sign = "+" if pos.unrealised_pnl >= 0 else ""
+            pnl_color = "green" if pos.unrealised_pnl >= 0 else "red"
+            console.print(
+                f"  📊 Position: [{pnl_color}]{pos.qty_held:,.0f} shares @ ₹{pos.avg_cost:.2f} avg[/] | "
+                f"Unrealised: [{pnl_color}]{pnl_sign}₹{pos.unrealised_pnl:,.0f} ({pnl_sign}{pos.unrealised_pnl_pct:.1f}%)[/] | "
+                f"Held: {pos.holding_days} days"
+            )
 
         # Qual summary
         if ql:
             sent_color = {"bullish": "green", "bearish": "red", "neutral": "yellow"}.get(ql.analyst_sentiment, "white")
             console.print(
-                f"  Qual: Sentiment=[{sent_color}]{ql.analyst_sentiment.upper()}[/]  "
-                f"Thesis={'[green]INTACT[/]' if ql.thesis_intact else '[red]BROKEN[/]'}  "
+                f"  Qual: Sentiment=[{sent_color}]{ql.analyst_sentiment.upper()}[/] "
+                f"Thesis={'[green]INTACT[/]' if ql.thesis_intact else '[red]BROKEN[/]'} "
                 f"Docs retrieved: {len(ql.retrieved_chunks)}"
             )
 
@@ -184,15 +271,15 @@ def print_step3(orch: "WisdomPMOrchestrator") -> None:
     if risk:
         r_color = "green" if risk.portfolio_risk_score < 4 else ("yellow" if risk.portfolio_risk_score < 7 else "red")
         console.print(
-            f"  Portfolio Risk Score: [{r_color}]{risk.portfolio_risk_score}/10[/]  "
-            f"Cyclical Exposure: {risk.cyclical_exposure_pct:.0f}%  "
+            f"  Portfolio Risk Score: [{r_color}]{risk.portfolio_risk_score}/10[/] "
+            f"Cyclical Exposure: {risk.cyclical_exposure_pct:.0f}% "
             f"Max Concentration: {risk.max_concentration_pct:.0f}%"
         )
         if risk.flags:
             risk_table = Table(title="Risk Flags", box=box.SIMPLE, border_style="dim")
             risk_table.add_column("Severity", width=10)
             risk_table.add_column("Category", width=14)
-            risk_table.add_column("Stock",    width=10)
+            risk_table.add_column("Stock", width=10)
             risk_table.add_column("Description", width=55)
             for f in sorted(risk.flags, key=lambda x: ["HIGH","MEDIUM","LOW"].index(x.severity)):
                 risk_table.add_row(
@@ -207,7 +294,7 @@ def print_memos(pm_output: "PMOrchestrationOutput") -> None:
     console.print(Rule("[bold gold1]HUMAN-IN-THE-LOOP — Trade Recommendation Memos[/]"))
     console.print(
         Panel(
-            "[yellow]⚠  No trade is executed automatically.[/]  "
+            "[yellow]⚠ No trade is executed automatically.[/] "
             "Each memo below requires explicit [bold]fund manager approval[/] via the CLI prompt.",
             border_style="yellow",
         )
@@ -224,16 +311,20 @@ def print_memos(pm_output: "PMOrchestrationOutput") -> None:
                 (memo.ticker, "bold cyan"),
                 " — ",
                 (memo.recommendation, sig_style),
-                f"  WISDOM {memo.wisdom_score:.1f}/10",
+                f" WISDOM {memo.wisdom_score:.1f}/10",
             )
         )
         synth_branch = tree.add("[dim]Agent Syntheses[/]")
         for s in memo.agent_syntheses:
             synth_branch.add(Text(s[:95], style="dim"))
 
-        tree.add(Text(f"Rationale : {memo.rationale[:100]}", style="italic"))
-        tree.add(Text(f"Instruction: {memo.instruction[:100]}", style="bold white"))
-        tree.add(Text(f"Risk Note  : {memo.risk_note[:100]}", style="yellow"))
+        # Position context (NEW)
+        if memo.position_context:
+            tree.add(Text(f"📊 Position : {memo.position_context[:120]}", style="cyan"))
+
+        tree.add(Text(f"Rationale   : {memo.rationale[:100]}", style="italic"))
+        tree.add(Text(f"Instruction : {memo.instruction[:100]}", style="bold white"))
+        tree.add(Text(f"Risk Note   : {memo.risk_note[:100]}", style="yellow"))
 
         if memo.bias_override_applied:
             tree.add("[red]⚡ Bias override applied — WISDOM discipline enforced[/]")
@@ -244,10 +335,10 @@ def print_memos(pm_output: "PMOrchestrationOutput") -> None:
             "[dim]PENDING APPROVAL[/]" if memo.approved is None
             else ("[green]✓ APPROVED[/]" if memo.approved else "[red]✗ REJECTED[/]")
         )
-        tree.add(f"Status: {status}  |  Generated: {memo.generated_at}")
+        tree.add(f"Status: {status} | Generated: {memo.generated_at}")
 
         console.print(Panel(tree, border_style="dim"))
-    console.print()
+        console.print()
 
 
 # ── HITL Approval Workflow ────────────────────────────────────────────────────────
@@ -265,18 +356,22 @@ def run_hitl_approval(orch: "WisdomPMOrchestrator") -> None:
 
     for memo in pending:
         sig_style = SIGNAL_STYLE.get(memo.recommendation, "white")
+        
+        # Build context panel with position info
+        context_lines = [
+            f"Recommendation: [{sig_style}]{memo.recommendation}[/]",
+            f"WISDOM Score: {memo.wisdom_score:.1f}/10",
+        ]
+        if memo.position_context:
+            context_lines.append(f"\n📊 Position: {memo.position_context[:150]}")
+        context_lines.extend([
+            f"\nInstruction: {memo.instruction[:120]}",
+            f"Risk: {memo.risk_note[:100]}",
+        ])
+        
         console.print(
             Panel(
-                Text.assemble(
-                    (f"{memo.ticker}  ", "bold cyan"),
-                    (memo.recommendation, sig_style),
-                    (f"  WISDOM {memo.wisdom_score:.1f}  ", "gold1"),
-                    (f"[{memo.urgency}]", SEV_STYLE.get(memo.urgency, "white")),
-                    "\n\n",
-                    (f"Instruction: {memo.instruction[:120]}", "bold white"),
-                    "\n",
-                    (f"Risk: {memo.risk_note[:100]}", "yellow"),
-                ),
+                "\n".join(context_lines),
                 title=f"Memo: {memo.ticker}",
                 border_style="blue",
             )
@@ -303,21 +398,22 @@ def print_architecture() -> None:
     console.print(Rule("[bold gold1]ARCHITECTURE — WISDOM-PM Stack[/]"))
 
     layers = [
-        ("Data Ingestion",     "Yahoo Finance / NSE APIs · Screener.in · TickerTape",     "cyan"),
-        ("Unstructured Data",  "Analyst PDFs (Kotak, JM, Anand Rathi) · Concall transcripts", "cyan"),
-        ("ETL / Processing",   "AWS Lambda DAGs · Daily OHLCV · Quarterly financials",    "blue"),
-        ("Vector DB",          "ChromaDB (Pinecone in prod) · Chunked embeddings for RAG","blue"),
-        ("Secure Storage",     "Encrypted PostgreSQL · Trade history NEVER sent to LLMs", "green"),
-        ("Agent 1 — Quant",    "Tool-Calling: LLM calls Python/Pandas — never computes numbers itself", "yellow"),
-        ("Agent 2 — Qual",     "RAG retrieval · Sentiment · Thesis-break detection",      "yellow"),
-        ("Agent 3 — Risk",     "Portfolio concentration · Cyclical exposure · Governance","yellow"),
-        ("Agent 4 — PM",       "Synthesis → Trade Memo → Human sign-off (HITL dashboard)","gold1"),
-        ("Hallucination Guard","LLM prohibited from arithmetic — Function Calling only",  "red"),
-        ("Cloud",              "AWS S3 · RDS · Pinecone · Lambda · EventBridge",          "dim"),
+        ("Data Ingestion", "Yahoo Finance / NSE APIs · Screener.in · TickerTape", "cyan"),
+        ("Trade Ledger", "Excel files → TradeLedger parser → Real P&L & cost basis", "cyan"),
+        ("Unstructured Data", "Analyst PDFs (Kotak, JM, Anand Rathi) · Concall transcripts", "cyan"),
+        ("ETL / Processing", "AWS Lambda DAGs · Daily OHLCV · Quarterly financials", "blue"),
+        ("Vector DB", "ChromaDB (Pinecone in prod) · Chunked embeddings for RAG", "blue"),
+        ("Secure Storage", "Encrypted PostgreSQL · Trade history NEVER sent to LLMs", "green"),
+        ("Agent 1 — Quant", "Tool-Calling: LLM calls Python/Pandas — never computes numbers itself", "yellow"),
+        ("Agent 2 — Qual", "RAG retrieval · Sentiment · Thesis-break detection", "yellow"),
+        ("Agent 3 — Risk", "Portfolio concentration · Cyclical exposure · Governance", "yellow"),
+        ("Agent 4 — PM", "Synthesis → Trade Memo → Human sign-off (HITL dashboard)", "gold1"),
+        ("Hallucination Guard", "LLM prohibited from arithmetic — Function Calling only", "red"),
+        ("Cloud", "AWS S3 · RDS · Pinecone · Lambda · EventBridge", "dim"),
     ]
 
     table = Table(box=box.SIMPLE_HEAVY, border_style="dim", show_header=False)
-    table.add_column("Layer",       style="bold", width=26)
+    table.add_column("Layer", style="bold", width=26)
     table.add_column("Description", width=68)
 
     for layer, desc, color in layers:
